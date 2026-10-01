@@ -24,16 +24,15 @@ if uploaded:
             break
 
     rm_df = xls[rm_sheet]
-    # Detect allergen cols (0/1 cols)
+        # Detect allergen cols - ONLY real allergen names, not GST etc
+    real_allergens = ['gluten','crustaceans','molluscs','milk','egg','fish','peanut','tree nut','soy','sulphite','sesame','mustard','celery','lupin','nuts']
     allergen_cols = []
     for c in rm_df.columns:
-        try:
-            vals = set(rm_df[c].dropna().unique())
-            if vals.issubset({0,1,0.0,1.0,'0','1',1,0}):
-                if c.lower() not in ['code','name','qty','quantity','price','cost','uom']:
-                    allergen_cols.append(c)
-        except:
-            pass
+        cl = str(c).lower()
+        for real in real_allergens:
+            if real in cl:
+                allergen_cols.append(c)
+                break
 
     st.write(f"Allergen columns found: {allergen_cols}")
 
