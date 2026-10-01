@@ -1,167 +1,134 @@
-"""Allergen propagation rules.
+import pandas as pd
 
-RM Master is the source of truth for allergens. Allergens propagate:
-  RM -> SFG  (any RM with allergen=1 in the SFG BOM sets that SFG allergen=1)
-  RM/SFG -> SKU  (any RM or SFG with allergen=1 in the SKU BOM sets that SKU allergen=1)
+def check_and_fix_allergens(wb_sheets):
+    """
+    RM Master is Source of Truth
+    RM -> SFG BOM -> SKU BOM -> SKU Overview auto-propagation
+    """
+    rm_df = wb_sheets['RM Master']
+    sfg_df = wb_sheets['SFG BOM']
+    sku_bom_df = wb_sheets['SKU BOM']
+    sku_overview_df = wb_sheets['SKU Overview']
 
-We recompute the 14 standard allergens for every SFG and SKU and compare with the
-existing values, recording mismatches and producing corrected values.
-"""
+    errors = []
 
-from utils import ALLERGENS, to_int, safe_str
+    # Find allergen columns (common allergens)
+    allergen_cols = [c for c in rm_df.columns if c.lower() in ['gluten','soy','milk','egg','peanut','nut','fish','shellfish','sesame','mustard','celery','lupin','sulphite','milk product','soy lecithin']]
+    # If not found by name, take columns after RM code/name that have 0/1 values
+    if not allergen_cols:
+        # assume allergen columns are those with only 0/1 values in RM Master
+        for col in rm_df.columns:
+            try:
+                vals = set(rm_df[col].dropna().unique())
+                if vals.issubset({0,1,0.0,1.0,'0','1'}):
+                    allergen_cols.append(col)
+            except:
+                pass
+        # Remove first few non-allergen columns
+        allergen_cols = [c for c in allergen_cols if c not in rm_df.columns[:4]]
 
+    print(f"Allergen columns detected: {allergen_cols}")
 
-def _allergen_col_name(allergen, columns):
-    """Find the column name corresponding to a given allergen."""
-    for col in columns:
-        if allergen.lower() in str(col).lower():
-            return col
-    return None
-
-
-def build_rm_allergen_map(rm_df, code_col, allergen_cols):
-    """Return {rm_code: {allergen_name: 0|1}} for all RM rows."""
-    rm_map = {}
-    if rm_df is None or code_col is None:
-        return rm_map
+    # Step 1: Build RM allergen map
+    rm_allergen_map = {}
+    rm_code_col = rm_df.columns[0] # first col is RM code
     for _, row in rm_df.iterrows():
-        code = safe_str(row.get(code_col))
-        if not code:
-            continue
-        rm_map[code] = {}
-        for allergen, col in allergen_cols.items():
-            if col is not None:
-                rm_map[code][allergen] = to_int(row.get(col))
-            else:
-                rm_map[code][allergen] = 0
-    return rm_map
+        rm_code = str(row[rm_code_col]).strip()
+        rm_allergen_map[rm_code] = {a: int(row[a]) if pd.notna(row[a]) else 0 for a in allergen_cols}
 
+    # Step 2: Fix SFG BOM - based on its RMs
+    # SFG BOM structure: SFG code + RM codes + allergen cols
+    sfg_code_col = sfg_df.columns[0]
+    sfg_rm_cols = sfg_df.columns[1:5] # adjust based on your sheet - RMs are listed
 
-def build_sfg_allergen_map(sfg_df, code_col, allergen_cols):
-    """Return {sfg_code: {allergen_name: 0|1}} for all SFG rows (from SFG sheet, not BOM)."""
-    sfg_map = {}
-    if sfg_df is None or code_col is None:
-        return sfg_map
-    for _, row in sfg_df.iterrows():
-        code = safe_str(row.get(code_col))
-        if not code:
-            continue
-        sfg_map[code] = {}
-        for allergen, col in allergen_cols.items():
-            if col is not None:
-                sfg_map[code][allergen] = to_int(row.get(col))
-            else:
-                sfg_map[code][allergen] = 0
-    return sfg_map
+    # For each SFG, collect its RMs and compute allergen
+    sfg_fixed = {}
+    for sfg_code in sfg_df[sfg_code_col].unique():
+        sfg_rows = sfg_df[sfg_df[sfg_code_col] == sfg_code]
+        # Get all RM codes used in this SFG
+        rm_list = []
+        for col in sfg_df.columns:
+            if 'RM' in str(col) or 'rm' in str(col).lower():
+                rm_list.extend(sfg_rows[col].dropna().astype(str).tolist())
 
+        # Calculate allergen as MAX of its RMs
+        computed = {a: 0 for a in allergen_cols}
+        for rm_code in rm_list:
+            rm_code = rm_code.strip()
+            if rm_code in rm_allergen_map:
+                for a in allergen_cols:
+                    computed[a] = max(computed[a], rm_allergen_map[rm_code].get(a,0))
 
-def _resolve_allergen_cols(df, allergen_cols):
-    """Given a partial allergen_cols dict, fill missing column names by scanning df."""
-    if df is None:
-        return allergen_cols
-    cols = list(df.columns)
-    for allergen in ALLERGENS:
-        if allergen_cols.get(allergen) is None:
-            allergen_cols[allergen] = _allergen_col_name(allergen, cols)
-    return allergen_cols
+        sfg_fixed[sfg_code] = computed
 
+        # Check mismatches
+        for _, row in sfg_rows.iterrows():
+            for a in allergen_cols:
+                if a in row:
+                    existing = int(row[a]) if pd.notna(row[a]) else 0
+                    if existing!= computed[a]:
+                        errors.append({
+                            'Sheet': 'SFG BOM',
+                            'Code': sfg_code,
+                            'Type': a,
+                            'Expected': computed[a],
+                            'Found': existing,
+                            'Message': f"SFG '{sfg_code}' {a} should be {computed[a]} but is {existing} (from RM)"
+                        })
 
-def compute_component_allergens(code, rm_map, sfg_map, _depth=0):
-    """Return {allergen: 0|1} for a component code, looking up RM then SFG."""
-    if _depth > 10:
-        return {a: 0 for a in ALLERGENS}
-    if code in rm_map:
-        return dict(rm_map[code])
-    if code in sfg_map:
-        return dict(sfg_map[code])
-    return {a: 0 for a in ALLERGENS}
+    # Apply fix to SFG BOM dataframe
+    for idx, row in sfg_df.iterrows():
+        sfg_code = str(row[sfg_code_col]).strip()
+        if sfg_code in sfg_fixed:
+            for a in allergen_cols:
+                if a in sfg_df.columns:
+                    sfg_df.at[idx, a] = sfg_fixed[sfg_code][a]
 
+    # Step 3: Fix SKU Overview - based on SFGs
+    sku_code_col_bom = sku_bom_df.columns[0]
+    sku_code_col_overview = sku_overview_df.columns[0]
 
-def verify_sfg_allergens(sfg_bom_df, rm_map, sfg_allergen_existing,
-                         component_col, parent_col, allergen_cols, result, sheet_name):
-    """For each SFG parent, aggregate allergens from its RM components and compare."""
-    if sfg_bom_df is None or parent_col is None or component_col is None:
-        return {}
+    # Build SFG allergen map (now fixed)
+    # Build SKU allergen from its SFGs
+    sku_fixed = {}
+    for sku_code in sku_bom_df[sku_code_col_bom].unique():
+        sku_rows = sku_bom_df[sku_bom_df[sku_code_col_bom] == sku_code]
+        sfg_list = []
+        for col in sku_bom_df.columns:
+            if 'SFG' in str(col) or 'sfg' in str(col).lower():
+                sfg_list.extend(sku_rows[col].dropna().astype(str).tolist())
 
-    # Group components by parent SFG code
-    sfg_components = {}
-    for _, row in sfg_bom_df.iterrows():
-        parent = safe_str(row.get(parent_col))
-        comp = safe_str(row.get(component_col))
-        if not parent or not comp:
-            continue
-        sfg_components.setdefault(parent, []).append(comp)
+        computed = {a: 0 for a in allergen_cols}
+        for sfg_code in sfg_list:
+            sfg_code = sfg_code.strip()
+            if sfg_code in sfg_fixed:
+                for a in allergen_cols:
+                    computed[a] = max(computed[a], sfg_fixed[sfg_code][a])
 
-    # Compute expected allergens per SFG
-    sfg_expected = {}
-    for parent, comps in sfg_components.items():
-        expected = {a: 0 for a in ALLERGENS}
-        for comp in comps:
-            comp_allergens = compute_component_allergens(comp, rm_map, {}, 0)
-            for a in ALLERGENS:
-                if comp_allergens.get(a, 0) == 1:
-                    expected[a] = 1
-        sfg_expected[parent] = expected
+        sku_fixed[sku_code] = computed
 
-        # Compare with existing values (from SFG sheet allergen map)
-        existing = sfg_allergen_existing.get(parent, {})
-        for allergen in ALLERGENS:
-            exp_val = expected[allergen]
-            got_val = to_int(existing.get(allergen, 0))
-            if exp_val != got_val:
-                col = allergen_cols.get(allergen)
-                result.add(
-                    sheet_name, 0, "Allergen",
-                    exp_val, got_val,
-                    f"SFG '{parent}' {allergen} should be {exp_val} but is {got_val}",
-                )
-                result.sfg_mismatches += 1
-    return sfg_expected
+    # Apply fix to SKU Overview
+    for idx, row in sku_overview_df.iterrows():
+        sku_code = str(row[sku_code_col_overview]).strip()
+        if sku_code in sku_fixed:
+            for a in allergen_cols:
+                if a in sku_overview_df.columns:
+                    # check error before fixing
+                    existing = int(row[a]) if pd.notna(row[a]) and a in row else 0
+                    expected = sku_fixed[sku_code][a]
+                    if existing!= expected:
+                        errors.append({
+                            'Sheet': 'SKU Overview',
+                            'Code': sku_code,
+                            'Type': a,
+                            'Expected': expected,
+                            'Found': existing,
+                            'Message': f"SKU '{sku_code}' {a} should be {expected} but is {existing} (from RM->SFG)"
+                        })
+                    sku_overview_df.at[idx, a] = expected
 
+    # Update sheets dict
+    wb_sheets['SFG BOM'] = sfg_df
+    wb_sheets['SKU Overview'] = sku_overview_df
 
-def verify_sku_allergens(sku_bom_df, rm_map, sfg_map, sku_allergen_existing,
-                         component_col, parent_col, allergen_cols, result, sheet_name):
-    """For each SKU parent, aggregate allergens from its RM/SFG components and compare."""
-    if sku_bom_df is None or parent_col is None or component_col is None:
-        return {}
-
-    sku_components = {}
-    for _, row in sku_bom_df.iterrows():
-        parent = safe_str(row.get(parent_col))
-        comp = safe_str(row.get(component_col))
-        if not parent or not comp:
-            continue
-        sku_components.setdefault(parent, []).append(comp)
-
-    sku_expected = {}
-    for parent, comps in sku_components.items():
-        expected = {a: 0 for a in ALLERGENS}
-        for comp in comps:
-            comp_allergens = compute_component_allergens(comp, rm_map, sfg_map, 0)
-            for a in ALLERGENS:
-                if comp_allergens.get(a, 0) == 1:
-                    expected[a] = 1
-        sku_expected[parent] = expected
-
-        existing = sku_allergen_existing.get(parent, {})
-        for allergen in ALLERGENS:
-            exp_val = expected[allergen]
-            got_val = to_int(existing.get(allergen, 0))
-            if exp_val != got_val:
-                result.add(
-                    sheet_name, 0, "Allergen",
-                    exp_val, got_val,
-                    f"SKU '{parent}' {allergen} should be {exp_val} but is {got_val}",
-                )
-                result.sfg_mismatches += 1
-    return sku_expected
-
-
-def get_allergen_cols(df):
-    """Return {allergen_name: column_name_or_None} for a dataframe."""
-    allergen_cols = {}
-    if df is None:
-        return {a: None for a in ALLERGENS}
-    for allergen in ALLERGENS:
-        allergen_cols[allergen] = _allergen_col_name(allergen, list(df.columns))
-    return allergen_cols
+    return errors, wb_sheets
