@@ -117,15 +117,7 @@ if uploaded:
                         sku_df.at[idx, new_col_name] = comp
             fixed_xls[sku_sheet] = sku_df
 
-            # Also create a NEW SHEET for traceability - RM -> SKU mapping
-            trace_rows = []
-            for sku_c, allergens in sku_computed.items():
-                row = {"SKU_Code": sku_c}
-                row.update(allergens)
-                trace_rows.append(row)
-            if trace_rows:
-                trace_df = pd.DataFrame(trace_rows)
-                fixed_xls["Allergen_Trace_RM_to_SKU"] = trace_df
+            
 
         # Show results
         st.success(f"Created {len(allergen_cols)} NEW Verified columns in SKU Overview without changing original columns!")
